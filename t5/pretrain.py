@@ -13,6 +13,7 @@ from t5.data import preprocessors
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-ms", "--model_size", type=str, required=True, help="Model Size")
+parser.add_argument("-sl", "--sequence_length", type=int, default=512, help="Model Sequence Length")
 args = parser.parse_args()
 
 # Experiment specific parameters
@@ -93,7 +94,7 @@ model = t5.models.MtfModel(
     tpu_topology=TPU_TOPOLOGY,
     model_parallelism=model_parallelism,
     batch_size=train_batch_size,
-    sequence_length={"inputs": 1024, "targets": 1024},
+    sequence_length={"inputs": args.sequence_length, "targets": args.sequence_length},
     save_checkpoints_steps=5000,
     keep_checkpoint_max=keep_checkpoint_max,
     iterations_per_loop=100,
