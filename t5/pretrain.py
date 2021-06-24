@@ -1,3 +1,4 @@
+import argparse
 import functools
 import os
 
@@ -8,11 +9,14 @@ import tensorflow.compat.v1 as tf
 tf.disable_v2_behavior()
 
 import t5
-# Custom vocab
 from t5.data import preprocessors
 
+parser = argparse.ArgumentParser()
+parser.add_argument("-ms", "--model_size", type=str, required=True, help="Model Size")
+args = parser.parse_args()
+
 # Experiment specific parameters
-MODEL_SIZE = "large"
+MODEL_SIZE = args.model_size.lower()
 BASE_DIR = f"gs://wikidepia/t5/"
 MODELS_DIR = os.path.join(BASE_DIR, f"models/{MODEL_SIZE}-c4")
 DATA_PATH = os.path.join(BASE_DIR, f"data/c4-filtered.txt")
@@ -44,9 +48,7 @@ def mc4_fn(x):
 TaskRegistry.remove("mc4_id_unsupervised")
 TaskRegistry.add(
     "mc4_id_unsupervised",
-    source=seqio.FileDataSource(
-        mc4_fn, {"train": DATA_PATH}
-    ),
+    source=seqio.FileDataSource(mc4_fn, {"train": DATA_PATH}),
     preprocessors=[
         functools.partial(
             preprocessors.rekey, key_map={"inputs": None, "targets": "text"}
@@ -67,9 +69,9 @@ TPU_ADDRESS = tpu.get_master()
 
 TPU_TOPOLOGY = "2x2"
 model_parallelism, train_batch_size, keep_checkpoint_max = {
-    "small": (1, 256, 16),
-    "base": (2, 128, 8),
-    "large": (8, 64, 4),
+    "small": (1, 256, 3),
+    "base": (2, 128, 3),
+    "large": (4, 64, 3),
     "3B": (8, 16, 1),
     "11B": (8, 16, 1),
 }[MODEL_SIZE]
@@ -91,9 +93,11 @@ model = t5.models.MtfModel(
     tpu_topology=TPU_TOPOLOGY,
     model_parallelism=model_parallelism,
     batch_size=train_batch_size,
-    sequence_length={"inputs": 512, "targets": 512},
+    sequence_length={"inputs": 1024, "targets": 1024},
     save_checkpoints_steps=5000,
-    keep_checkpoint_max=5,
+    keep_checkpoint_max=keep_checkpoint_max,
     iterations_per_loop=100,
 )
-model.train(mixture_or_task_name="mc4_id_unsupervised", steps=1000000)
+model.train(
+    mixture_or_task_name="mc4_id_unsupervised", steps=1000000, init_checkpoint=None
+)
