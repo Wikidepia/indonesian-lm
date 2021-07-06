@@ -88,11 +88,16 @@ class DataTrainingArguments:
     dataset_config_name: Optional[str] = field(
         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
     )
+    train_file: Optional[str] = field(default=None, metadata={"help": "The input training data file (a text file)."})
     train_split_name: Optional[str] = field(
         default="train",
         metadata={
             "help": "The name of the training data set split to use (via the datasets library). Defaults to 'train'"
         },
+    )
+    validation_file: Optional[str] = field(
+        default=None,
+        metadata={"help": "An optional input evaluation data file to evaluate the perplexity on (a text file)."},
     )
     validation_split_name: Optional[str] = field(
         default="validation",
@@ -272,38 +277,34 @@ def main():
     configure_logger(model_args, training_args)
 
     # Downloading and loading a dataset from the hub.
-    datasets = load_dataset(data_args.dataset_name, data_args.dataset_config_name, cache_dir=model_args.cache_dir)
+    if data_args.dataset_name is not None:
+        datasets = load_dataset(data_args.dataset_name, data_args.dataset_config_name, cache_dir=model_args.cache_dir)
 
-    if "validation" not in datasets.keys():
-        # make sure only "validation" and "train" keys remain"
-        datasets = DatasetDict()
-        datasets["validation"] = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split=f"{data_args.train_split_name}[:{data_args.validation_split_percentage}%]",
-            cache_dir=model_args.cache_dir,
-        )
-        datasets["train"] = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split=f"{data_args.train_split_name}[{data_args.validation_split_percentage}%:]",
-            cache_dir=model_args.cache_dir,
-        )
+        if "validation" not in datasets.keys():
+            # make sure only "validation" and "train" keys remain"
+            datasets = DatasetDict()
+            datasets["validation"] = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split=f"{data_args.train_split_name}[:{data_args.validation_split_percentage}%]",
+                cache_dir=model_args.cache_dir,
+            )
+            datasets["train"] = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split=f"{data_args.train_split_name}[{data_args.validation_split_percentage}%:]",
+                cache_dir=model_args.cache_dir,
+            )
     else:
-        # make sure only "validation" and "train" keys remain"
-        datasets = DatasetDict()
-        datasets["validation"] = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split="validation",
-            cache_dir=model_args.cache_dir,
-        )
-        datasets["train"] = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            split=f"{data_args.train_split_name}",
-            cache_dir=model_args.cache_dir,
-        )
+        data_files = {}
+        if data_args.train_file is not None:
+            data_files["train"] = data_args.train_file
+        if data_args.validation_file is not None:
+            data_files["validation"] = data_args.validation_file
+        extension = data_args.train_file.split(".")[-1]
+        if extension == "txt":
+            extension = "text"
+        datasets = load_dataset(extension, data_files=data_files, cache_dir=model_args.cache_dir)
 
     # only normalized-inputs-training is supported
     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
