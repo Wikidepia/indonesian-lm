@@ -131,7 +131,6 @@ class DataTrainingArguments:
             "help": "If set will pad the sequence to a multiple of the provided value. This is important to avoid triggering recompilations on TPU"
         },
     )
-    num_train_steps: int = field(default=50000, metadata={"help": "The number of training steps."})
 
 
 @flax.struct.dataclass
@@ -279,7 +278,7 @@ def main():
 
     # Downloading and loading a dataset from the hub.
     if data_args.dataset_name is not None:
-        datasets = load_dataset(data_args.dataset_name, data_args.dataset_config_name, cache_dir=model_args.cache_dir, streaming=True)
+        datasets = load_dataset(data_args.dataset_name, data_args.dataset_config_name, cache_dir=model_args.cache_dir)
 
         if "validation" not in datasets.keys():
             # make sure only "validation" and "train" keys remain"
@@ -289,14 +288,12 @@ def main():
                 data_args.dataset_config_name,
                 split=f"{data_args.train_split_name}[:{data_args.validation_split_percentage}%]",
                 cache_dir=model_args.cache_dir,
-                streaming=True,
             )
             datasets["train"] = load_dataset(
                 data_args.dataset_name,
                 data_args.dataset_config_name,
                 split=f"{data_args.train_split_name}[{data_args.validation_split_percentage}%:]",
                 cache_dir=model_args.cache_dir,
-                streaming=True,
             )
     else:
         data_files = {}
@@ -387,7 +384,7 @@ def main():
     train_batch_size = int(training_args.per_device_train_batch_size) * jax.device_count()
     eval_batch_size = int(training_args.per_device_eval_batch_size) * jax.device_count()
 
-    num_train_steps = data_args.num_train_steps
+    num_train_steps = len(vectorized_datasets["train"]) // train_batch_size * num_epochs
 
     # Create learning rate schedule
     warmup_fn = optax.linear_schedule(
@@ -505,62 +502,61 @@ def main():
 
         return metrics
 
-    training_iter = iter(vectorized_datasets)
     p_eval_step = jax.pmap(eval_step, "batch", donate_argnums=(0,))
 
     # Replicate the train state on each device
     state = jax_utils.replicate(state)
 
     train_time = 0
-    epoch = 0
     train_metrics = []
-    steps = tqdm(range(num_train_steps), desc="Training...", position=0)
-    
-    for cur_step in range(num_train_steps):
+    epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
+    for epoch in epochs:
         # ======================== Training ================================
-        try:
-            samples = [next(iter(vectorized_datasets["train"])) for _ in range(train_batch_size)]
-        except StopIteration:
-            # Once the end of the dataset stream is reached, the training iterator
-            # is reinitialized and reshuffled and a new eval dataset is randomely chosen.
-            epoch += 1
-            vectorized_datasets.set_epoch(epoch)
-            samples = [next(iter(vectorized_datasets["train"])) for _ in range(train_batch_size)]
-            eval_samples = [eval_sample for eval_sample in next(iter(vectorized_datasets["validation"]))]
-
         train_start = time.time()
 
-        samples = [vectorized_datasets["train"][int(idx)] for idx in batch_idx]
-        model_inputs = data_collator(samples)
-        model_inputs = shard(model_inputs.data)
+        # Create sampling rng
+        rng, input_rng = jax.random.split(rng)
 
-        # Model forward
-        state, train_metric, dropout_rngs, gumbel_rngs = p_train_step(
-            state, model_inputs, dropout_rngs, gumbel_rngs
-        )
-        train_metrics.append(train_metric)
+        # Generate an epoch by shuffling sampling indices from the train dataset
+        num_train_samples = len(vectorized_datasets["train"])
+        train_samples_idx = jax.random.permutation(input_rng, jnp.arange(num_train_samples))
+        train_batch_idx = generate_batch_splits(train_samples_idx, train_batch_size)
 
-        if cur_step % training_args.logging_steps == 0 and cur_step > 0:
-            # Save metrics
-            train_metric = jax_utils.unreplicate(train_metric)
-            train_time += time.time() - train_start
-            if has_tensorboard and jax.process_index() == 0:
-                write_train_metric(summary_writer, train_metrics, train_time, cur_step)
+        # Gather the indexes for creating the batch and do a training step
+        for step, batch_idx in enumerate(tqdm(train_batch_idx, desc="Training...", position=1)):
+            samples = [vectorized_datasets["train"][int(idx)] for idx in batch_idx]
+            model_inputs = data_collator(samples)
+            model_inputs = shard(model_inputs.data)
 
-            steps.write(
-                f"Step... ({cur_step} | Loss: {train_metric['loss'].mean()}, Learning Rate: {train_metric['learning_rate'].mean()})"
+            # Model forward
+            state, train_metric, dropout_rngs, gumbel_rngs = p_train_step(
+                state, model_inputs, dropout_rngs, gumbel_rngs
             )
+            train_metrics.append(train_metric)
 
-            train_metrics = []
+            cur_step = epoch * (num_train_samples // train_batch_size) + step
+
+            if cur_step % training_args.logging_steps == 0 and cur_step > 0:
+                # Save metrics
+                train_metric = jax_utils.unreplicate(train_metric)
+                train_time += time.time() - train_start
+                if has_tensorboard and jax.process_index() == 0:
+                    write_train_metric(summary_writer, train_metrics, train_time, cur_step)
+
+                epochs.write(
+                    f"Step... ({cur_step} | Loss: {train_metric['loss'].mean()}, Learning Rate: {train_metric['learning_rate'].mean()})"
+                )
+
+                train_metrics = []
 
         # ======================== Evaluating ==============================
-        num_eval_samples = len(eval_samples)
+        num_eval_samples = len(vectorized_datasets["validation"])
         eval_samples_idx = jnp.arange(num_eval_samples)
         eval_batch_idx = generate_batch_splits(eval_samples_idx, eval_batch_size)
 
         eval_metrics = []
         for i, batch_idx in enumerate(tqdm(eval_batch_idx, desc="Evaluating ...", position=2)):
-            samples = [eval_samples[int(idx)] for idx in batch_idx]
+            samples = [vectorized_datasets["validation"][int(idx)] for idx in batch_idx]
             model_inputs = data_collator(samples)
 
             # Model forward
@@ -579,6 +575,7 @@ def main():
 
         # Save metrics
         if has_tensorboard and jax.process_index() == 0:
+            cur_step = epoch * (len(vectorized_datasets["train"]) // train_batch_size)
             write_eval_metric(summary_writer, eval_metrics, cur_step)
 
         # save checkpoint after each epoch and push checkpoint to the hub
