@@ -505,8 +505,7 @@ def main():
 
         return metrics
 
-    training_iter = iter(vectorized_datasets["train"])
-    eval_iter = iter(vectorized_datasets["validation"])
+    training_iter = iter(vectorized_datasets)
     p_eval_step = jax.pmap(eval_step, "batch", donate_argnums=(0,))
 
     # Replicate the train state on each device
@@ -516,24 +515,22 @@ def main():
     epoch = 0
     train_metrics = []
     steps = tqdm(range(num_train_steps), desc="Training...", position=0)
-    eval_samples = [eval_sample for eval_sample in next(eval_iter)]
-
+    
     for cur_step in range(num_train_steps):
         # ======================== Training ================================
         try:
-            samples = [next(training_iter) for _ in range(train_batch_size)]
+            samples = [next(iter(vectorized_datasets["train"])) for _ in range(train_batch_size)]
         except StopIteration:
             # Once the end of the dataset stream is reached, the training iterator
             # is reinitialized and reshuffled and a new eval dataset is randomely chosen.
             epoch += 1
             vectorized_datasets.set_epoch(epoch)
-            training_iter = iter(vectorized_datasets["train"])
-            eval_iter = iter(vectorized_datasets["validation"])
-    
-            samples = [next(training_iter) for _ in range(train_batch_size)]
-            eval_samples = [eval_sample for eval_sample in next(eval_iter)]
+            samples = [next(iter(vectorized_datasets["train"])) for _ in range(train_batch_size)]
+            eval_samples = [eval_sample for eval_sample in next(iter(vectorized_datasets["validation"]))]
 
         train_start = time.time()
+
+        samples = [vectorized_datasets["train"][int(idx)] for idx in batch_idx]
         model_inputs = data_collator(samples)
         model_inputs = shard(model_inputs.data)
 
@@ -562,7 +559,7 @@ def main():
         eval_batch_idx = generate_batch_splits(eval_samples_idx, eval_batch_size)
 
         eval_metrics = []
-        for i, batch_idx in enumerate(tqdm(eval_batch_idx, desc="Evaluating ...", position=1)):
+        for i, batch_idx in enumerate(tqdm(eval_batch_idx, desc="Evaluating ...", position=2)):
             samples = [eval_samples[int(idx)] for idx in batch_idx]
             model_inputs = data_collator(samples)
 
@@ -576,8 +573,8 @@ def main():
         eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
 
         # Update progress bar
-        steps.write(
-            f"Steps... ({cur_step} | Loss: {eval_metrics['loss']}, Perplexity: {eval_metrics['codevector_perplexity']})"
+        epochs.write(
+            f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {eval_metrics['loss']}, Perplexity: {eval_metrics['codevector_perplexity']})"
         )
 
         # Save metrics
