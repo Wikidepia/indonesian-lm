@@ -7,14 +7,14 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 import numpy as np
-from datasets import DatasetDict, load_dataset
 from tqdm import tqdm
-
+import torch
 import flax
 import jax
 import jax.numpy as jnp
 import librosa
 import optax
+from glob import glob
 from flax import jax_utils, traverse_util
 from flax.training import train_state
 from flax.training.common_utils import get_metrics, onehot, shard
@@ -82,41 +82,8 @@ class DataTrainingArguments:
     the command line.
     """
 
-    dataset_name: str = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
-    )
-    dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
-    )
-    train_file: Optional[str] = field(default=None, metadata={"help": "The input training data file (a text file)."})
-    train_split_name: Optional[str] = field(
-        default="train",
-        metadata={
-            "help": "The name of the training data set split to use (via the datasets library). Defaults to 'train'"
-        },
-    )
-    validation_file: Optional[str] = field(
-        default=None,
-        metadata={"help": "An optional input evaluation data file to evaluate the perplexity on (a text file)."},
-    )
-    validation_split_name: Optional[str] = field(
-        default="validation",
-        metadata={
-            "help": "The name of the validation data set split to use (via the datasets library). Defaults to 'validation'"
-        },
-    )
-    speech_file_column: Optional[str] = field(
-        default="file",
-        metadata={"help": "Column in the dataset that contains speech file path. Defaults to 'file'"},
-    )
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached preprocessed datasets or not."}
-    )
-    validation_split_percentage: Optional[int] = field(
-        default=5,
-        metadata={
-            "help": "The percentage of the train set used as validation set in case there's no validation split"
-        },
     )
     preprocessing_num_workers: Optional[int] = field(
         default=None,
@@ -195,6 +162,18 @@ class FlaxDataCollatorForWav2Vec2Pretraining:
 
         return batch
 
+class AudioDataset(torch.utils.data.Dataset):
+    def __init__(self, speech_files, feature_extractor):
+        self.speech_files = speech_files
+        self.feature_extractor = feature_extractor
+
+    def __len__(self):
+        return len(self.speech_files)
+
+    def __getitem__(self, index):
+        speech_file = self.dataframe.iloc[index]
+        speech, _ = librosa.load(speech_file, sr=self.feature_extractor.sampling_rate)
+        return self.feature_extractor(speech, sampling_rate=self.feature_extractor.sampling_rate)
 
 def configure_logger(model_args: ModelArguments, training_args: TrainingArguments):
     logging.basicConfig(
@@ -216,11 +195,6 @@ def write_train_metric(summary_writer, train_metrics, train_time, step):
         tag = f"train_{key}"
         for i, val in enumerate(vals):
             summary_writer.scalar(tag, val, step - len(vals) + i + 1)
-
-
-def write_eval_metric(summary_writer, eval_metrics, step):
-    for metric_name, value in eval_metrics.items():
-        summary_writer.scalar(f"eval_{metric_name}", value, step)
 
 
 def generate_batch_splits(samples_idx: jnp.ndarray, batch_size: int) -> jnp.ndarray:
@@ -276,66 +250,9 @@ def main():
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     configure_logger(model_args, training_args)
 
-    # Downloading and loading a dataset from the hub.
-    if data_args.dataset_name is not None:
-        datasets = load_dataset(data_args.dataset_name, data_args.dataset_config_name, cache_dir=model_args.cache_dir)
-
-        if "validation" not in datasets.keys():
-            # make sure only "validation" and "train" keys remain"
-            datasets = DatasetDict()
-            datasets["validation"] = load_dataset(
-                data_args.dataset_name,
-                data_args.dataset_config_name,
-                split=f"{data_args.train_split_name}[:{data_args.validation_split_percentage}%]",
-                cache_dir=model_args.cache_dir,
-            )
-            datasets["train"] = load_dataset(
-                data_args.dataset_name,
-                data_args.dataset_config_name,
-                split=f"{data_args.train_split_name}[{data_args.validation_split_percentage}%:]",
-                cache_dir=model_args.cache_dir,
-            )
-    else:
-        data_files = {}
-        if data_args.train_file is not None:
-            data_files["train"] = data_args.train_file
-        if data_args.validation_file is not None:
-            data_files["validation"] = data_args.validation_file
-        extension = data_args.train_file.split(".")[-1]
-        if extension == "txt":
-            extension = "text"
-        datasets = load_dataset(extension, data_files=data_files, cache_dir=model_args.cache_dir)
-
     # only normalized-inputs-training is supported
     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
         model_args.model_name_or_path, cache_dir=model_args.cache_dir, do_normalize=True
-    )
-
-    def prepare_dataset(batch):
-        # check that all files have the correct sampling rate
-        batch["speech"], _ = librosa.load(batch[data_args.speech_file_column], sr=feature_extractor.sampling_rate)
-        return batch
-
-    # load audio files into numpy arrays
-    vectorized_datasets = datasets.map(
-        prepare_dataset, num_proc=data_args.preprocessing_num_workers, remove_columns=datasets["train"].column_names
-    )
-
-    # filter audio files that are too long
-    vectorized_datasets = vectorized_datasets.filter(
-        lambda data: len(data["speech"]) < int(data_args.max_duration_in_seconds * feature_extractor.sampling_rate)
-    )
-
-    def normalize(batch):
-        return feature_extractor(batch["speech"], sampling_rate=feature_extractor.sampling_rate)
-
-    # normalize and transform to `BatchFeatures`
-    vectorized_datasets = vectorized_datasets.map(
-        normalize,
-        batched=True,
-        num_proc=data_args.preprocessing_num_workers,
-        load_from_cache_file=not data_args.overwrite_cache,
-        remove_columns=vectorized_datasets["train"].column_names,
     )
 
     # pretraining is only supported for "newer" stable layer norm architecture
@@ -384,7 +301,10 @@ def main():
     train_batch_size = int(training_args.per_device_train_batch_size) * jax.device_count()
     eval_batch_size = int(training_args.per_device_eval_batch_size) * jax.device_count()
 
-    num_train_steps = len(vectorized_datasets["train"]) // train_batch_size * num_epochs
+    speech_files = glob("podcast/*.ogg")
+    dataset = AudioDataset(speech_files, feature_extractor=feature_extractor)
+    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, batch_size=train_batch_size, shuffle=False, num_workers=48, pin_memory=True)
+    num_train_steps = len(speech_files) // train_batch_size * num_epochs
 
     # Create learning rate schedule
     warmup_fn = optax.linear_schedule(
@@ -478,32 +398,6 @@ def main():
     # Create parallel version of the train step
     p_train_step = jax.pmap(train_step, "batch", donate_argnums=(0,))
 
-    # Define eval fn
-    def eval_step(params, batch):
-        negative_indices = batch.pop("sampled_negative_indices")
-
-        outputs = model(**batch, params=params, train=False)
-
-        contrastive_loss = compute_contrastive_loss(
-            outputs.projected_quantized_states,
-            outputs.projected_states,
-            negative_indices,
-            batch["mask_time_indices"],
-            contrastive_logits_temperature,
-            num_negatives,
-        )
-
-        diversity_loss = (num_codevectors - outputs.codevector_perplexity) / num_codevectors
-        loss = contrastive_loss + diversity_loss_weight * diversity_loss
-
-        # summarize metrics
-        metrics = {"loss": loss.mean(), "codevector_perplexity": outputs.codevector_perplexity}
-        metrics = jax.lax.pmean(metrics, axis_name="batch")
-
-        return metrics
-
-    p_eval_step = jax.pmap(eval_step, "batch", donate_argnums=(0,))
-
     # Replicate the train state on each device
     state = jax_utils.replicate(state)
 
@@ -512,19 +406,9 @@ def main():
     epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
     for epoch in epochs:
         # ======================== Training ================================
-        train_start = time.time()
-
-        # Create sampling rng
-        rng, input_rng = jax.random.split(rng)
-
-        # Generate an epoch by shuffling sampling indices from the train dataset
-        num_train_samples = len(vectorized_datasets["train"])
-        train_samples_idx = jax.random.permutation(input_rng, jnp.arange(num_train_samples))
-        train_batch_idx = generate_batch_splits(train_samples_idx, train_batch_size)
-
-        # Gather the indexes for creating the batch and do a training step
-        for step, batch_idx in enumerate(tqdm(train_batch_idx, desc="Training...", position=1)):
-            samples = [vectorized_datasets["train"][int(idx)] for idx in batch_idx]
+        train_start = time.time()        
+        train_pbar = tqdm(len(speech_files) // train_batch_size, desc="Training...", position=1)
+        for step, samples in enumerate(dataloader):
             model_inputs = data_collator(samples)
             model_inputs = shard(model_inputs.data)
 
@@ -534,7 +418,7 @@ def main():
             )
             train_metrics.append(train_metric)
 
-            cur_step = epoch * (num_train_samples // train_batch_size) + step
+            cur_step = epoch * (len(speech_files) // train_batch_size) + step
 
             if cur_step % training_args.logging_steps == 0 and cur_step > 0:
                 # Save metrics
@@ -548,35 +432,7 @@ def main():
                 )
 
                 train_metrics = []
-
-        # ======================== Evaluating ==============================
-        num_eval_samples = len(vectorized_datasets["validation"])
-        eval_samples_idx = jnp.arange(num_eval_samples)
-        eval_batch_idx = generate_batch_splits(eval_samples_idx, eval_batch_size)
-
-        eval_metrics = []
-        for i, batch_idx in enumerate(tqdm(eval_batch_idx, desc="Evaluating ...", position=2)):
-            samples = [vectorized_datasets["validation"][int(idx)] for idx in batch_idx]
-            model_inputs = data_collator(samples)
-
-            # Model forward
-            model_inputs = shard(model_inputs.data)
-            metrics = p_eval_step(state.params, model_inputs)
-            eval_metrics.append(metrics)
-
-        # get eval metrics
-        eval_metrics = get_metrics(eval_metrics)
-        eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
-
-        # Update progress bar
-        epochs.write(
-            f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {eval_metrics['loss']}, Perplexity: {eval_metrics['codevector_perplexity']})"
-        )
-
-        # Save metrics
-        if has_tensorboard and jax.process_index() == 0:
-            cur_step = epoch * (len(vectorized_datasets["train"]) // train_batch_size)
-            write_eval_metric(summary_writer, eval_metrics, cur_step)
+            train_pbar.update()
 
         # save checkpoint after each epoch and push checkpoint to the hub
         if jax.process_index() == 0:
