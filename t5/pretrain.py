@@ -18,11 +18,11 @@ args = parser.parse_args()
 
 # Experiment specific parameters
 MODEL_SIZE = args.model_size.lower()
-BASE_DIR = f"gs://wikidepia/t5/"
+BASE_DIR = 'gs://wikidepia/t5/'
 MODELS_DIR = os.path.join(BASE_DIR, f"models/{MODEL_SIZE}-c4")
-DATA_PATH = os.path.join(BASE_DIR, f"data/c4-filtered.txt")
+DATA_PATH = os.path.join(BASE_DIR, 'data/c4-filtered.txt')
 
-VOCAB_PATH = os.path.join(BASE_DIR, f"sp10m.cased.t5.model")
+VOCAB_PATH = os.path.join(BASE_DIR, 'sp10m.cased.t5.model')
 DEFAULT_EXTRA_IDS = 100
 
 

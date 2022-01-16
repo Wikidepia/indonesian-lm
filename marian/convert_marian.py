@@ -28,15 +28,11 @@ import sentencepiece as spm
 
 
 def remove_suffix(text: str, suffix: str):
-    if text.endswith(suffix):
-        return text[: -len(suffix)]
-    return text  # or whatever
+    return text[: -len(suffix)] if text.endswith(suffix) else text
 
 
 def remove_prefix(text: str, prefix: str):
-    if text.startswith(prefix):
-        return text[len(prefix) :]
-    return text  # or whatever
+    return text[len(prefix) :] if text.startswith(prefix) else text
 
 
 def convert_encoder_layer(opus_dict, layer_prefix: str, converter: dict):
@@ -68,10 +64,11 @@ def find_pretrained_model(src_lang: str, tgt_lang: str) -> List[str]:
     src_and_targ = [
         remove_prefix(m, prefix).lower().split("-") for m in model_ids if "+" not in m
     ]  # + cant be loaded.
-    matching = [
-        f"{prefix}{a}-{b}" for (a, b) in src_and_targ if src_lang in a and tgt_lang in b
+    return [
+        f"{prefix}{a}-{b}"
+        for (a, b) in src_and_targ
+        if src_lang in a and tgt_lang in b
     ]
-    return matching
 
 
 def add_emb_entries(wemb, final_bias, n_special_tokens=1):
@@ -113,8 +110,7 @@ def load_config_from_state_dict(opus_dict):
 def find_model_file(dest_dir):  # this one better
     model_files = list(Path(dest_dir).glob("*.npz"))
     assert len(model_files) == 1, model_files
-    model_file = model_files[0]
-    return model_file
+    return model_files[0]
 
 
 def save_tokenizer_config(dest_dir: Path):
@@ -281,17 +277,13 @@ class OpusState:
 
     @property
     def extra_keys(self):
-        extra = []
-        for k in self.state_keys:
-            if (
-                k.startswith("encoder_l")
-                or k.startswith("decoder_l")
-                or k in [CONFIG_KEY, "Wemb", "Wpos", "decoder_ff_logit_out_b"]
-            ):
-                continue
-            else:
-                extra.append(k)
-        return extra
+        return [
+            k
+            for k in self.state_keys
+            if not k.startswith("encoder_l")
+            and not k.startswith("decoder_l")
+            and k not in [CONFIG_KEY, "Wemb", "Wpos", "decoder_ff_logit_out_b"]
+        ]
 
     def sub_keys(self, layer_prefix):
         return [

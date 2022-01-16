@@ -204,8 +204,7 @@ def generate_batch_splits(samples_idx: jnp.ndarray, batch_size: int) -> jnp.ndar
     if samples_to_remove != 0:
         samples_idx = samples_idx[:-samples_to_remove]
     sections_split = num_samples // batch_size
-    batch_idx = np.split(samples_idx, sections_split)
-    return batch_idx
+    return np.split(samples_idx, sections_split)
 
 
 def compute_contrastive_loss(
@@ -380,9 +379,7 @@ def main():
             )
 
             diversity_loss = (num_codevectors - outputs.codevector_perplexity) / num_codevectors
-            loss = contrastive_loss + diversity_loss_weight * diversity_loss
-
-            return loss
+            return contrastive_loss + diversity_loss_weight * diversity_loss
 
         grad_fn = jax.value_and_grad(loss_fn)
         loss, grad = grad_fn(state.params)
